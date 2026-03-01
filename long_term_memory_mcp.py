@@ -611,7 +611,7 @@ class RobustMemorySystem:
                 result_data.append(result_dict)
 
             self.logger.info(
-                "Semantic search returned %d results {threshold=%.3f)",
+                "Semantic search returned %d results (threshold=%.3f)",
                 len(result_data),
                 threshold,
             )
@@ -1259,7 +1259,7 @@ class RobustMemorySystem:
                 return None
 
             # Anchor idle time on last_accessed; fallback to timestamp
-            last_accessed = row["last_accessed"] if "last_accessed" in row.keys() else None
+            last_accessed = row["last_accessed"] if "last_accessed" in row else None
             if not last_accessed:
                 last_accessed = row["timestamp"]
 
@@ -1808,8 +1808,6 @@ atexit.register(memory_system.close)
 
 if __name__ == "__main__":
     try:
-        # Default: stdio transport, port unused
-        #asyncio.run(mcp.run_stdio_async())
         asyncio.run(mcp.run_stdio_async(show_banner=False))
     except KeyboardInterrupt:
         print("\nShutting down memory system...")

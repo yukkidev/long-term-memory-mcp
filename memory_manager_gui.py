@@ -532,7 +532,7 @@ class MemoryManagerGUI:
             file_path = filedialog.asksaveasfilename(
                 defaultextension=".json",
                 filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
-                initialfile=f"lissa_memories_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
+                initialfile=f"memories_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
             )
             
             if not file_path:
