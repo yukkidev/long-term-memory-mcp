@@ -119,11 +119,41 @@ REINFORCEMENT_MAX = 10  # cap importance
 # don't need to change their variable names.
 
 EMBEDDING_BACKEND = config.get_embedding_backend_type()
-SENTENCE_TRANSFORMER_MODEL = config.get_model_name() or "all-MiniLM-L6-v2"
+_EMBEDDING_MODEL_RAW = config.get_model_name()  # May be None or a cross-backend stale value
 EMBEDDING_OFFLINE = config.get_offline()
-OLLAMA_MODEL = config.get_model_name() or "nomic-embed-text:latest"
 OLLAMA_BASE_URL = config.get_base_url()
 FALLBACK_DIMENSIONS = config.get_dimensions()
+
+# Validate model names to prevent cross-backend contamination.
+# Ollama model names (e.g. "nomic-embed-text:latest") are NOT valid HuggingFace
+# sentence-transformer IDs, and vice versa. If a stale model name from a different
+# backend is detected, we fall back to the default for that backend.
+_ST_VALID_PATTERNS = (":", "/", "nomic", "embed", "ollama")
+_OLLAMA_VALID_PATTERNS = (":", "/")
+
+
+def _make_st_model(model: Optional[str]) -> str:
+    if model and not any(p in model for p in _ST_VALID_PATTERNS):
+        return model
+    return "all-MiniLM-L6-v2"
+
+
+def _make_ollama_model(model: Optional[str]) -> str:
+    if model and any(p in model for p in _OLLAMA_VALID_PATTERNS):
+        return model
+    return "nomic-embed-text:latest"
+
+
+SENTENCE_TRANSFORMER_MODEL = (
+    _make_st_model(_EMBEDDING_MODEL_RAW)
+    if EMBEDDING_BACKEND == "sentence-transformers"
+    else "all-MiniLM-L6-v2"
+)
+OLLAMA_MODEL = (
+    _make_ollama_model(_EMBEDDING_MODEL_RAW)
+    if EMBEDDING_BACKEND == "ollama"
+    else "nomic-embed-text:latest"
+)
 # -----------------------------------------
 
 
@@ -528,30 +558,60 @@ class RobustMemorySystem:
             self.logger.error("Integrity check failed: %s", e)
 
     def _check_embedding_model_change(self):
-        """Check if embedding model has changed and warn if reindexing might be needed."""
+        """Check if embedding model has changed and warn if reindexing might be needed.
+
+        Compares BOTH model name and dimensions against stored values.
+        A dimension mismatch is fatal by default (to prevent silent corruption).
+        Set EMBEDDING_FORCE_LOAD=1 to override and proceed with a warning — this
+        allows the server to start so rebuild_vectors() can be called.
+        """
+        # Allow override via env var so the server can start even on mismatch,
+        # enabling rebuild_vectors() to be called for recovery.
+        force_load = os.environ.get("EMBEDDING_FORCE_LOAD", "").lower() in ("1", "true", "yes")
+
         try:
-            # Get current model info
             current_model = self.embedding_backend.get_model_name()
             current_dimensions = self.embedding_backend.get_dimensions()
 
-            # Try to get stored model info from SQLite
             try:
                 cursor = self.sqlite_conn.execute(
                     "SELECT value FROM system_config WHERE key = 'embedding_model'"
                 )
-                stored_model = cursor.fetchone()
-                if stored_model:
-                    stored_model = stored_model[0]
+                row = cursor.fetchone()
+                stored_model = row[0] if row else None
 
-                    # Check if model has changed
-                    if stored_model != current_model:
-                        self.logger.warning(
-                            f"Embedding model changed from '{stored_model}' to '{current_model}'. "
-                            f"Consider running reindex_vectors() for optimal search quality."
-                        )
+                cursor2 = self.sqlite_conn.execute(
+                    "SELECT value FROM system_config WHERE key = 'embedding_dimensions'"
+                )
+                row2 = cursor2.fetchone()
+                stored_dims = int(row2[0]) if row2 else None
             except Exception:
-                # Table or row might not exist, that's OK for first run
-                pass
+                stored_model = None
+                stored_dims = None
+
+            # Check for dimension mismatch
+            if stored_dims is not None and stored_dims != current_dimensions:
+                msg = (
+                    f"Embedding dimension mismatch! Collection was indexed with "
+                    f"{stored_dims}d vectors, but the current backend produces "
+                    f"{current_dimensions}d embeddings. "
+                    + ("EMBEDDING_FORCE_LOAD is set — proceeding anyway; call rebuild_vectors() to fix."
+                        if force_load else
+                        "Set EMBEDDING_FORCE_LOAD=1 to override and run rebuild_vectors().")
+                )
+                if force_load:
+                    self.logger.warning(f"WARNING: {msg}")
+                else:
+                    self.logger.error(msg)
+                    raise ValueError(msg)
+
+            # Warn if model name changed (dimensions are fine, but embeddings may differ)
+            if stored_model is not None and stored_model != current_model:
+                self.logger.warning(
+                    f"Embedding model changed from '{stored_model}' to '{current_model}'. "
+                    f"Dimensions match ({current_dimensions}d) but semantic similarity "
+                    f"scores may be different. Run rebuild_vectors() if search quality degrades."
+                )
 
             # Store current model info for future checks
             try:
@@ -565,9 +625,11 @@ class RobustMemorySystem:
                 )
                 self.sqlite_conn.commit()
             except Exception as e:
-                # Might need to create the table first
                 self.logger.debug(f"Could not store model config: {e}")
 
+        except ValueError:
+            # Re-raise fatal dimension-mismatch errors
+            raise
         except Exception as e:
             self.logger.debug(f"Error checking embedding model change: {e}")
 
