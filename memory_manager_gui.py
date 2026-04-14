@@ -1107,9 +1107,11 @@ class MemoryManagerGUI:
             self.status_detail.config(text="")
 
     def _refresh_ollama_models(self):
-        """Refresh Ollama model list in a background thread."""
+        """Refresh Ollama model list using polling (tkinter-safe)."""
         self.ollama_status_label.config(text="Refreshing...", foreground="#888888")
         base_url = self.ollama_url_var.get().strip()
+        self._ollama_discovery_result = None
+        self._ollama_discovery_error = None
 
         def do_discovery():
             try:
@@ -1117,16 +1119,23 @@ class MemoryManagerGUI:
 
                 models = OllamaDiscovery.list_models(base_url)
                 model_names = [m.name for m in models] if models else []
-                self.root.after(
-                    0, lambda: self._update_ollama_models(model_names, base_url)
-                )
+                self._ollama_discovery_result = (model_names, base_url)
             except Exception as e:
-                self.root.after(
-                    0, lambda: self._update_ollama_models([], base_url, error=str(e))
-                )
+                self._ollama_discovery_error = str(e)
 
         thread = threading.Thread(target=do_discovery, daemon=True)
         thread.start()
+        self._poll_ollama_discovery()
+
+    def _poll_ollama_discovery(self):
+        """Poll for discovery completion and update UI when done."""
+        if self._ollama_discovery_result:
+            model_names, base_url = self._ollama_discovery_result
+            self._update_ollama_models(model_names, base_url)
+        elif self._ollama_discovery_error:
+            self._update_ollama_models([], "", error=self._ollama_discovery_error)
+        else:
+            self.root.after(100, self._poll_ollama_discovery)
 
     def _update_ollama_models(
         self, model_names: list, base_url: str, error: str = None
@@ -1151,16 +1160,37 @@ class MemoryManagerGUI:
             )
 
     def _refresh_st_models(self, combobox):
-        """Refresh Sentence Transformers model list."""
-        try:
-            from embedding_backends import SentenceTransformersDiscovery
+        """Refresh Sentence Transformers model list using polling (tkinter-safe)."""
+        self._st_discovery_result = None
+        self._st_discovery_error = None
+        self._st_combobox = combobox
 
-            models = SentenceTransformersDiscovery.list_local_models()
-            combobox["values"] = [f"{name} ({dims}d)" for name, dims in models]
+        def do_discovery():
+            try:
+                from embedding_backends import SentenceTransformersDiscovery
+
+                models = SentenceTransformersDiscovery.list_local_models()
+                self._st_discovery_result = models
+            except Exception as e:
+                self._st_discovery_error = str(e)
+
+        thread = threading.Thread(target=do_discovery, daemon=True)
+        thread.start()
+        self._poll_st_discovery()
+
+    def _poll_st_discovery(self):
+        """Poll for ST discovery completion and update UI when done."""
+        if self._st_discovery_result is not None:
+            models = self._st_discovery_result
+            self._st_combobox["values"] = [f"{name} ({dims}d)" for name, dims in models]
             if models:
-                combobox.current(0)
-        except Exception as e:
-            messagebox.showwarning("Discovery Failed", f"Could not list models: {e}")
+                self._st_combobox.current(0)
+        elif self._st_discovery_error:
+            messagebox.showwarning(
+                "Discovery Failed", f"Could not list models: {self._st_discovery_error}"
+            )
+        else:
+            self.root.after(100, self._poll_st_discovery)
 
     def _rebuild_vectors(self, backend: str, backend_cfg: Dict[str, Any]):
         """
