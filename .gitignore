@@ -1,0 +1,9 @@
+config.json
+status.json
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+.env
+.ruff_cache/
