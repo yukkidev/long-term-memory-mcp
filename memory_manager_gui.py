@@ -20,6 +20,7 @@ import shutil
 from datetime import datetime, timezone
 from typing import List, Dict, Any, Optional
 import os
+import threading
 
 # Configuration
 DATA_FOLDER = Path(os.environ.get("AI_COMPANION_DATA_DIR", str(Path.home() / "Documents" / "ai_companion_memory")))
@@ -51,13 +52,31 @@ class MemoryManagerGUI:
         
         # Current selection
         self.selected_memory_id = None
-        
+
+        # Load config for settings tab
+        self._load_config()
+
         # Build UI
-        self.create_widgets()
-        
+        self.create_tabs()
+
         # Load initial data
         self.refresh_memories()
         self.update_statistics()
+
+    def _load_config(self):
+        """Load existing config to pre-select values in the Settings tab."""
+        try:
+            from config_manager import Config
+            self.config = Config()
+        except Exception:
+            # Config not available (MCP not running), use defaults
+            class DummyConfig:
+                def get_embedding_backend_type(self): return "sentence-transformers"
+                def get_model_name(self): return None
+                def get_offline(self): return True
+                def get_base_url(self): return "http://localhost:11434"
+                def get_dimensions(self): return 384
+            self.config = DummyConfig()
         
     def configure_styles(self):
         """Configure custom styles for widgets"""
@@ -97,46 +116,65 @@ class MemoryManagerGUI:
             messagebox.showerror("Database Error", f"Failed to connect to database:\n{str(e)}")
             self.root.quit()
     
-    def create_widgets(self):
-        """Create all GUI widgets"""
+    def create_tabs(self):
+        """Create tabbed interface: Memories tab + Settings tab."""
         # Main container
         main_frame = ttk.Frame(self.root, padding="10")
         main_frame.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
-        
+
         # Configure grid weights
         self.root.columnconfigure(0, weight=1)
         self.root.rowconfigure(0, weight=1)
-        main_frame.columnconfigure(1, weight=1)
-        main_frame.rowconfigure(1, weight=1)
-        
+
+        # Notebook for tabs
+        self.notebook = ttk.Notebook(main_frame)
+        self.notebook.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
+
+        # Memories tab
+        self.memories_tab = ttk.Frame(self.notebook, padding="5")
+        self.notebook.add(self.memories_tab, text="Memories")
+        self._build_memories_tab()
+
+        # Settings tab
+        self.settings_tab = ttk.Frame(self.notebook, padding="20")
+        self.notebook.add(self.settings_tab, text="Settings")
+        self._build_settings_tab()
+
+    def _build_memories_tab(self):
+        """Build the Memories tab content."""
+        parent = self.memories_tab
+        parent.columnconfigure(0, weight=1)
+        parent.columnconfigure(1, weight=1)
+        parent.rowconfigure(1, weight=1)
+
         # ===== HEADER =====
-        header_frame = ttk.Frame(main_frame)
+        header_frame = ttk.Frame(parent)
         header_frame.grid(row=0, column=0, columnspan=2, sticky=(tk.W, tk.E), pady=(0, 10))
-        
+
         title_label = ttk.Label(header_frame, text="Memory Manager", style='Title.TLabel')
         title_label.grid(row=0, column=0, sticky=tk.W)
-        
+
         subtitle_label = ttk.Label(header_frame, text="View and manage AI companion memories", style='Subtitle.TLabel')
         subtitle_label.grid(row=1, column=0, sticky=tk.W)
-        
+
         # ===== LEFT PANEL - Search and List =====
-        left_panel = ttk.Frame(main_frame, padding="5")
+        left_panel = ttk.Frame(parent, padding="5")
         left_panel.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(0, 5))
         left_panel.columnconfigure(0, weight=1)
         left_panel.rowconfigure(2, weight=1)
-        
+
         # Search section
         search_frame = ttk.LabelFrame(left_panel, text="Search Memories", padding="10")
         search_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
         search_frame.columnconfigure(1, weight=1)
-        
+
         # Search by text
         ttk.Label(search_frame, text="Search:", style='Normal.TLabel').grid(row=0, column=0, sticky=tk.W, pady=2)
         self.search_var = tk.StringVar()
-        self.search_var.trace('w', lambda *args: self.on_search_changed())
+        self.search_var.trace_add('write', lambda *args: self.on_search_changed())
         search_entry = ttk.Entry(search_frame, textvariable=self.search_var, font=('Segoe UI', 10))
         search_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=2, padx=(5, 0))
-        
+
         # Filter by type
         ttk.Label(search_frame, text="Type:", style='Normal.TLabel').grid(row=1, column=0, sticky=tk.W, pady=2)
         self.type_var = tk.StringVar(value="All")
@@ -144,42 +182,42 @@ class MemoryManagerGUI:
         type_combo['values'] = ['All', 'conversation', 'fact', 'preference', 'event', 'task', 'ephemeral']
         type_combo.grid(row=1, column=1, sticky=(tk.W, tk.E), pady=2, padx=(5, 0))
         type_combo.bind('<<ComboboxSelected>>', lambda e: self.refresh_memories())
-        
+
         # Filter by importance
         ttk.Label(search_frame, text="Min Importance:", style='Normal.TLabel').grid(row=2, column=0, sticky=tk.W, pady=2)
         self.importance_var = tk.StringVar(value="1")
         importance_spin = ttk.Spinbox(search_frame, from_=1, to=10, textvariable=self.importance_var, width=10, font=('Segoe UI', 10))
         importance_spin.grid(row=2, column=1, sticky=tk.W, pady=2, padx=(5, 0))
         importance_spin.bind('<Return>', lambda e: self.refresh_memories())
-        
+
         # Filter by tags
         ttk.Label(search_frame, text="Tags:", style='Normal.TLabel').grid(row=3, column=0, sticky=tk.W, pady=2)
         self.tags_filter_var = tk.StringVar()
         tags_entry = ttk.Entry(search_frame, textvariable=self.tags_filter_var, font=('Segoe UI', 10))
         tags_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=2, padx=(5, 0))
         tags_entry.bind('<Return>', lambda e: self.refresh_memories())
-        
+
         # Search button
         search_btn = ttk.Button(search_frame, text="Search", command=self.refresh_memories, style='Accent.TButton')
         search_btn.grid(row=4, column=0, columnspan=2, pady=(10, 0))
-        
+
         # Statistics section
         stats_frame = ttk.LabelFrame(left_panel, text="Statistics", padding="10")
         stats_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        
+
         self.stats_label = ttk.Label(stats_frame, text="Loading...", style='Normal.TLabel', justify=tk.LEFT)
         self.stats_label.grid(row=0, column=0, sticky=tk.W)
-        
+
         # Memory list
         list_frame = ttk.LabelFrame(left_panel, text="Memories", padding="5")
         list_frame.grid(row=2, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         list_frame.columnconfigure(0, weight=1)
         list_frame.rowconfigure(0, weight=1)
-        
+
         # Treeview for memories
         columns = ('ID', 'Title', 'Type', 'Importance', 'Date')
         self.tree = ttk.Treeview(list_frame, columns=columns, show='tree headings', selectmode='browse')
-        
+
         # Configure columns
         self.tree.column('#0', width=0, stretch=tk.NO)
         self.tree.column('ID', width=0, stretch=tk.NO)
@@ -187,85 +225,85 @@ class MemoryManagerGUI:
         self.tree.column('Type', width=100)
         self.tree.column('Importance', width=80, anchor=tk.CENTER)
         self.tree.column('Date', width=150)
-        
+
         # Configure headings
         self.tree.heading('Title', text='Title')
         self.tree.heading('Type', text='Type')
         self.tree.heading('Importance', text='Importance')
         self.tree.heading('Date', text='Date')
-        
+
         # Scrollbar
         scrollbar = ttk.Scrollbar(list_frame, orient=tk.VERTICAL, command=self.tree.yview)
         self.tree.configure(yscrollcommand=scrollbar.set)
-        
+
         self.tree.grid(row=0, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         scrollbar.grid(row=0, column=1, sticky=(tk.N, tk.S))
-        
+
         # Bind selection event
         self.tree.bind('<<TreeviewSelect>>', self.on_memory_selected)
-        
+
         # ===== RIGHT PANEL - Details and Actions =====
-        right_panel = ttk.Frame(main_frame, padding="5")
+        right_panel = ttk.Frame(parent, padding="5")
         right_panel.grid(row=1, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), padx=(5, 0))
         right_panel.columnconfigure(0, weight=1)
         right_panel.rowconfigure(1, weight=1)
-        
+
         # Action buttons
         action_frame = ttk.Frame(right_panel)
         action_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 10))
-        
+
         ttk.Button(action_frame, text="New Memory", command=self.new_memory).grid(row=0, column=0, padx=2)
         ttk.Button(action_frame, text="Save Changes", command=self.save_memory).grid(row=0, column=1, padx=2)
         ttk.Button(action_frame, text="Delete", command=self.delete_memory).grid(row=0, column=2, padx=2)
         ttk.Button(action_frame, text="Refresh", command=self.refresh_memories).grid(row=0, column=3, padx=2)
         ttk.Button(action_frame, text="Backup", command=self.create_backup).grid(row=0, column=4, padx=2)
         ttk.Button(action_frame, text="Export", command=self.export_memories).grid(row=0, column=5, padx=2)
-        
+
         # Details section
         details_frame = ttk.LabelFrame(right_panel, text="Memory Details", padding="10")
         details_frame.grid(row=1, column=0, sticky=(tk.W, tk.E, tk.N, tk.S))
         details_frame.columnconfigure(1, weight=1)
         details_frame.rowconfigure(5, weight=1)
-        
+
         # ID (hidden, for reference)
         self.id_var = tk.StringVar()
-        
+
         # Title
         ttk.Label(details_frame, text="Title:", style='Header.TLabel').grid(row=0, column=0, sticky=tk.W, pady=5)
         self.title_var = tk.StringVar()
         title_entry = ttk.Entry(details_frame, textvariable=self.title_var, font=('Segoe UI', 11))
         title_entry.grid(row=0, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
-        
+
         # Type
         ttk.Label(details_frame, text="Type:", style='Header.TLabel').grid(row=1, column=0, sticky=tk.W, pady=5)
         self.detail_type_var = tk.StringVar()
         type_detail_combo = ttk.Combobox(details_frame, textvariable=self.detail_type_var, state='readonly', font=('Segoe UI', 10))
         type_detail_combo['values'] = ['conversation', 'fact', 'preference', 'event', 'task', 'ephemeral']
         type_detail_combo.grid(row=1, column=1, sticky=tk.W, pady=5, padx=(10, 0))
-        
+
         # Importance
         ttk.Label(details_frame, text="Importance:", style='Header.TLabel').grid(row=2, column=0, sticky=tk.W, pady=5)
         self.detail_importance_var = tk.StringVar()
         importance_detail_spin = ttk.Spinbox(details_frame, from_=1, to=10, textvariable=self.detail_importance_var, width=10, font=('Segoe UI', 10))
         importance_detail_spin.grid(row=2, column=1, sticky=tk.W, pady=5, padx=(10, 0))
-        
+
         # Tags
         ttk.Label(details_frame, text="Tags:", style='Header.TLabel').grid(row=3, column=0, sticky=tk.W, pady=5)
         self.tags_var = tk.StringVar()
         tags_detail_entry = ttk.Entry(details_frame, textvariable=self.tags_var, font=('Segoe UI', 10))
         tags_detail_entry.grid(row=3, column=1, sticky=(tk.W, tk.E), pady=5, padx=(10, 0))
         ttk.Label(details_frame, text="(comma-separated)", font=('Segoe UI', 8), foreground='#888888').grid(row=4, column=1, sticky=tk.W, padx=(10, 0))
-        
+
         # Content
         ttk.Label(details_frame, text="Content:", style='Header.TLabel').grid(row=5, column=0, sticky=(tk.W, tk.N), pady=5)
         self.content_text = scrolledtext.ScrolledText(details_frame, wrap=tk.WORD, font=('Segoe UI', 10), height=15)
         self.content_text.grid(row=5, column=1, sticky=(tk.W, tk.E, tk.N, tk.S), pady=5, padx=(10, 0))
-        
+
         # Metadata display
         metadata_frame = ttk.LabelFrame(right_panel, text="Metadata", padding="10")
         metadata_frame.grid(row=2, column=0, sticky=(tk.W, tk.E), pady=(10, 0))
         metadata_frame.columnconfigure(0, weight=1)
-        
+
         self.metadata_label = ttk.Label(metadata_frame, text="Select a memory to view details", style='Normal.TLabel', justify=tk.LEFT)
         self.metadata_label.grid(row=0, column=0, sticky=tk.W)
     
@@ -589,6 +627,282 @@ class MemoryManagerGUI:
             
         except Exception as e:
             self.stats_label.config(text=f"Error loading stats:\n{str(e)}")
+
+    def _build_settings_tab(self):
+        """Build the Settings tab with embedding backend configuration."""
+        parent = self.settings_tab
+        parent.columnconfigure(0, weight=1)
+
+        # Current Status section
+        status_frame = ttk.LabelFrame(parent, text="Current Loaded Backend", padding="15")
+        status_frame.grid(row=0, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
+        status_frame.columnconfigure(1, weight=1)
+
+        self.status_indicator = tk.Label(status_frame, text="Loading...", font=('Segoe UI', 11), anchor='w')
+        self.status_indicator.grid(row=0, column=0, sticky='w', pady=5)
+
+        ttk.Button(status_frame, text="Refresh Status", command=self._refresh_status).grid(row=0, column=1, sticky='e', padx=(10, 0))
+
+        self.status_detail = tk.Label(status_frame, text="", font=('Segoe UI', 9), foreground='#888888', anchor='w')
+        self.status_detail.grid(row=1, column=0, columnspan=2, sticky='w')
+
+        # Load initial status
+        self._refresh_status()
+
+        # Embedding Configuration section
+        embed_frame = ttk.LabelFrame(parent, text="Embedding Configuration", padding="15")
+        embed_frame.grid(row=1, column=0, sticky=(tk.W, tk.E), pady=(0, 15))
+        embed_frame.columnconfigure(1, weight=1)
+
+        # Backend type selector
+        ttk.Label(embed_frame, text="Backend Type:", style='Header.TLabel').grid(row=0, column=0, sticky='w', pady=8)
+        self.settings_backend_var = tk.StringVar(value=self.config.get_embedding_backend_type())
+        backend_combo = ttk.Combobox(
+            embed_frame, textvariable=self.settings_backend_var,
+            values=['sentence-transformers', 'ollama', 'fallback'],
+            state='readonly', font=('Segoe UI', 10)
+        )
+        backend_combo.grid(row=0, column=1, sticky='ew', pady=8, padx=(10, 0))
+        backend_combo.bind('<<ComboboxSelected>>', self._on_backend_changed)
+
+        # Separator
+        ttk.Separator(embed_frame, orient='horizontal').grid(row=1, column=0, columnspan=2, sticky='ew', pady=10)
+
+        # Backend-specific panels (stacked vertically, one shown at a time)
+        self.backend_panels = {}
+
+        # --- Sentence Transformers panel ---
+        st_panel = ttk.Frame(embed_frame)
+
+        ttk.Label(st_panel, text="Model:", style='Normal.TLabel').grid(row=0, column=0, sticky='w', pady=5)
+        st_model_value = self.config.get_model_name() or "all-MiniLM-L6-v2"
+        self.st_model_var = tk.StringVar(value=st_model_value)
+        st_model_combo = ttk.Combobox(
+            st_panel, textvariable=self.st_model_var, font=('Segoe UI', 10), width=40
+        )
+        st_model_combo.grid(row=0, column=1, sticky='w', pady=5, padx=(10, 0))
+
+        self.st_offline_var = tk.BooleanVar(value=self.config.get_offline())
+        ttk.Checkbutton(
+            st_panel, text="Offline mode (use only locally cached models)",
+            variable=self.st_offline_var
+        ).grid(row=1, column=0, columnspan=2, sticky='w', pady=5)
+
+        ttk.Button(
+            st_panel, text="Refresh Local Models",
+            command=lambda: self._refresh_st_models(st_model_combo)
+        ).grid(row=2, column=0, columnspan=2, sticky='w', pady=(5, 0))
+
+        self.backend_panels['sentence-transformers'] = st_panel
+
+        # --- Ollama / LM Studio panel ---
+        ollama_panel = ttk.Frame(embed_frame)
+
+        ttk.Label(ollama_panel, text="Base URL:", style='Normal.TLabel').grid(row=0, column=0, sticky='w', pady=5)
+        self.ollama_url_var = tk.StringVar(value=self.config.get_base_url())
+        ttk.Entry(
+            ollama_panel, textvariable=self.ollama_url_var,
+            font=('Segoe UI', 10), width=40
+        ).grid(row=0, column=1, sticky='w', pady=5, padx=(10, 0))
+
+        ttk.Label(ollama_panel, text="Model:", style='Normal.TLabel').grid(row=1, column=0, sticky='w', pady=5)
+        ollama_model_value = self.config.get_model_name() or "nomic-embed-text:latest"
+        self.ollama_model_var = tk.StringVar(value=ollama_model_value)
+        self.ollama_model_combo = ttk.Combobox(
+            ollama_panel, textvariable=self.ollama_model_var,
+            font=('Segoe UI', 10), width=40
+        )
+        self.ollama_model_combo.grid(row=1, column=1, sticky='w', pady=5, padx=(10, 0))
+
+        self.ollama_status_label = ttk.Label(ollama_panel, text="", foreground='#888888', font=('Segoe UI', 9))
+        self.ollama_status_label.grid(row=2, column=0, columnspan=2, sticky='w', pady=5)
+
+        ttk.Button(
+            ollama_panel, text="Refresh Model List",
+            command=self._refresh_ollama_models
+        ).grid(row=3, column=0, columnspan=2, sticky='w', pady=(5, 0))
+
+        self.backend_panels['ollama'] = ollama_panel
+
+        # --- Fallback panel ---
+        fallback_panel = ttk.Frame(embed_frame)
+
+        ttk.Label(fallback_panel, text="Dimensions:", style='Normal.TLabel').grid(row=0, column=0, sticky='w', pady=5)
+        self.fallback_dim_var = tk.IntVar(value=self.config.get_dimensions())
+        ttk.Spinbox(
+            fallback_panel, from_=64, to=4096, increment=64,
+            textvariable=self.fallback_dim_var, width=10,
+            font=('Segoe UI', 10)
+        ).grid(row=0, column=1, sticky='w', pady=5, padx=(10, 0))
+
+        ttk.Label(
+            fallback_panel, text="Note: Fallback uses a simple random-projection backend. Not suitable for production.",
+            style='Normal.TLabel', foreground='#ff8800', font=('Segoe UI', 8)
+        ).grid(row=1, column=0, columnspan=2, sticky='w', pady=(5, 0))
+
+        self.backend_panels['fallback'] = fallback_panel
+
+        # Place all panels in the embed_frame (row=2), hidden by default
+        for panel in self.backend_panels.values():
+            panel.grid(row=2, column=0, columnspan=2, sticky='w')
+            panel.grid_remove()
+
+        # Show the correct panel for the current backend
+        self._on_backend_changed()
+
+        # Action buttons
+        btn_frame = ttk.Frame(parent)
+        btn_frame.grid(row=2, column=0, sticky='w', pady=(10, 0))
+
+        ttk.Button(btn_frame, text="Save Settings", command=self._save_settings, style='Accent.TButton').pack(side='left', padx=5)
+        ttk.Button(btn_frame, text="Reset to Defaults", command=self._reset_settings).pack(side='left', padx=5)
+
+        ttk.Label(
+            btn_frame, text="Note: Changes require MCP server restart to take effect.",
+            foreground='#ff8800', font=('Segoe UI', 9)
+        ).pack(side='left', padx=20)
+
+    def _on_backend_changed(self, *args):
+        """Show/hide the correct backend-specific panel and reset backend-appropriate defaults."""
+        selected = self.settings_backend_var.get()
+        for backend, panel in self.backend_panels.items():
+            if backend == selected:
+                panel.grid()
+            else:
+                panel.grid_remove()
+
+        # Reset model to backend-appropriate default when switching
+        if selected == "sentence-transformers":
+            self.st_model_var.set("all-MiniLM-L6-v2")
+        elif selected == "ollama":
+            self.ollama_model_var.set("nomic-embed-text:latest")
+        elif selected == "fallback":
+            self.fallback_dim_var.set(384)
+
+    def _refresh_status(self):
+        """Read the status.json written by the MCP server to show what's actually loaded."""
+        try:
+            status_path = Path.home() / ".lmstudio/extensions/plugins/installed/long-term-memory-mcp" / "status.json"
+            if status_path.exists():
+                with open(status_path) as f:
+                    status = json.load(f)
+
+                loaded = status.get("loaded_backend", "unknown")
+                dims = status.get("loaded_dimensions", "?")
+                cfg_backend = status.get("config_backend", "?")
+                cfg_model = status.get("config_model", "?")
+                ts = status.get("timestamp", "")
+
+                self.status_indicator.config(
+                    text=f"✓ {loaded} ({dims} dims)",
+                    foreground='green'
+                )
+                self.status_detail.config(
+                    text=f"Config: {cfg_backend} / {cfg_model} | Loaded: {ts}"
+                )
+            else:
+                self.status_indicator.config(
+                    text="✗ No status file — MCP server may not be running",
+                    foreground='red'
+                )
+                self.status_detail.config(text="Start the MCP server to see loaded backend status")
+        except Exception as e:
+            self.status_indicator.config(text=f"✗ Error reading status: {e}", foreground='red')
+            self.status_detail.config(text="")
+
+    def _refresh_ollama_models(self):
+        """Refresh Ollama model list in a background thread."""
+        self.ollama_status_label.config(text="Refreshing...", foreground='#888888')
+        base_url = self.ollama_url_var.get().strip()
+
+        def do_discovery():
+            try:
+                from embedding_backends import OllamaDiscovery
+                models = OllamaDiscovery.list_models(base_url)
+                model_names = [m.name for m in models] if models else []
+                self.root.after(0, lambda: self._update_ollama_models(model_names, base_url))
+            except Exception as e:
+                self.root.after(0, lambda: self._update_ollama_models([], base_url, error=str(e)))
+
+        thread = threading.Thread(target=do_discovery, daemon=True)
+        thread.start()
+
+    def _update_ollama_models(self, model_names: list, base_url: str, error: str = None):
+        """Called on main thread after model discovery completes."""
+        if error or not model_names:
+            self.ollama_model_combo['values'] = []
+            if error:
+                self.ollama_status_label.config(text=f"Error: {error}", foreground='red')
+            else:
+                self.ollama_status_label.config(
+                    text=f"Could not reach {base_url} — check server is running",
+                    foreground='red'
+                )
+        else:
+            self.ollama_model_combo['values'] = model_names
+            self.ollama_status_label.config(
+                text=f"Connected to {base_url} — {len(model_names)} models found",
+                foreground='green'
+            )
+
+    def _refresh_st_models(self, combobox):
+        """Refresh Sentence Transformers model list."""
+        try:
+            from embedding_backends import SentenceTransformersDiscovery
+            models = SentenceTransformersDiscovery.list_local_models()
+            combobox['values'] = [f"{name} ({dims}d)" for name, dims in models]
+            if models:
+                combobox.current(0)
+        except Exception as e:
+            messagebox.showwarning("Discovery Failed", f"Could not list models: {e}")
+
+    def _save_settings(self):
+        """Save current settings to config.json."""
+        backend = self.settings_backend_var.get()
+
+        # Determine model name based on backend
+        if backend == "sentence-transformers":
+            model_raw = self.st_model_var.get()
+            model = model_raw.split(" (")[0]  # Strip " (384d)" suffix if present
+        elif backend == "ollama":
+            model = self.ollama_model_var.get()
+        else:
+            model = None
+
+        offline = self.st_offline_var.get() if backend == "sentence-transformers" else True
+        base_url = self.ollama_url_var.get().strip() if backend == "ollama" else "http://localhost:11434"
+
+        config_data = {
+            "embedding": {
+                "backend": backend,
+                "model": model,
+                "offline": offline,
+                "base_url": base_url,
+            },
+            "fallback_dimensions": self.fallback_dim_var.get() if backend == "fallback" else 384,
+        }
+
+        try:
+            from config_manager import Config
+            cfg = Config()
+            cfg.save(config_data)
+            messagebox.showinfo(
+                "Settings Saved",
+                "Configuration saved successfully.\n\n"
+                "Please restart the MCP server for changes to take effect."
+            )
+        except Exception as e:
+            messagebox.showerror("Save Failed", f"Could not save config: {e}")
+
+    def _reset_settings(self):
+        """Reset settings to defaults."""
+        self.settings_backend_var.set("sentence-transformers")
+        self.st_model_var.set("all-MiniLM-L6-v2")
+        self.st_offline_var.set(True)
+        self.ollama_url_var.set("http://localhost:11434")
+        self.ollama_model_var.set("nomic-embed-text:latest")
+        self.fallback_dim_var.set(384)
+        self._on_backend_changed()
     
     def on_closing(self):
         """Handle window closing"""

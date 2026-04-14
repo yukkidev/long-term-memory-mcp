@@ -33,15 +33,34 @@ import sys
 import atexit
 from fastmcp import FastMCP
 
+# Local imports
+try:
+    from .embedding_backends import create_embedding_backend
+except ImportError:
+    # Fallback for direct execution
+    from embedding_backends import create_embedding_backend
+
+# Config loading (must happen before RobustMemorySystem is instantiated)
+print("[MCP] Loading config...")
+try:
+    from .config_manager import Config
+except ImportError:
+    from config_manager import Config
+
+config = Config()  # Module-level singleton
+print(f"[MCP] Config loaded: backend={config.get_embedding_backend_type()}, model={config.get_model_name()}, base_url={config.get_base_url()}")
+
+# Status file path — written by MCP server, read by GUI
+DEFAULT_CONFIG_DIR = config.config_path.parent
+STATUS_FILE = DEFAULT_CONFIG_DIR / "status.json"
 
 # Third-party imports (will be installed)
 
 try:
     import chromadb
     from chromadb.config import Settings
-    from sentence_transformers import SentenceTransformer
 except ImportError as e:
-    print("Missing required packages. Install with: pip install chromadb sentence-transformers")
+    print("Missing required packages. Install with: pip install chromadb")
     print(f"Error: {e}")
     sys.exit(1)
 
@@ -50,7 +69,9 @@ except ImportError as e:
 # Example (PowerShell): $env:AI_COMPANION_DATA_DIR = "D:\a.i. apps\long_term_memory_mcp\data"
 
 DATA_FOLDER = Path(
-    os.environ.get("AI_COMPANION_DATA_DIR", str(Path.home() / "Documents" / "ai_companion_memory"))
+    os.environ.get(
+        "AI_COMPANION_DATA_DIR", str(Path.home() / "Documents" / "ai_companion_memory")
+    )
 )
 
 # -------- Lazy Decay Configuration --------
@@ -90,6 +111,20 @@ REINFORCEMENT_STEP = 0.1  # amount per retrieval
 REINFORCEMENT_WRITEBACK_STEP = 0.5  # write to DB when accumulated ≥ 0.5
 REINFORCEMENT_MAX = 10  # cap importance
 # ---------------------------------------------
+
+# -------- Embedding Configuration --------
+# All config now flows through the `config` object (loaded from config.json + env vars).
+# For backward compatibility, we read from `config` but keep the module-level
+# constants as derived values so existing code paths (e.g., _init_embeddings)
+# don't need to change their variable names.
+
+EMBEDDING_BACKEND = config.get_embedding_backend_type()
+SENTENCE_TRANSFORMER_MODEL = config.get_model_name() or "all-MiniLM-L6-v2"
+EMBEDDING_OFFLINE = config.get_offline()
+OLLAMA_MODEL = config.get_model_name() or "nomic-embed-text:latest"
+OLLAMA_BASE_URL = config.get_base_url()
+FALLBACK_DIMENSIONS = config.get_dimensions()
+# -----------------------------------------
 
 
 @dataclass
@@ -174,7 +209,7 @@ class RobustMemorySystem:
         self.sqlite_conn = None  # will be set in _init_sqlite
         self.chroma_client: Optional[object] = None
         self.chroma_collection: Optional[object] = None
-        self.embedding_model: Optional[object] = None
+        self.embedding_backend = None  # Will be set in _init_embeddings
 
         # Setup logging
         self._setup_logging()
@@ -187,35 +222,34 @@ class RobustMemorySystem:
         # Perform integrity check on startup
         self._integrity_check()
 
+        # Check for embedding model changes that might require reindexing
+        self._check_embedding_model_change()
+
     def _setup_logging(self):
         """Setup logging for debugging and monitoring"""
         log_file = self.data_folder / "memory_system.log"
-        
+
         # Daily rotation, keep 30 days
         file_handler = TimedRotatingFileHandler(
-            log_file,
-            when="midnight",
-            interval=1,
-            backupCount=30,
-            utc=False
+            log_file, when="midnight", interval=1, backupCount=30, utc=False
         )
         file_handler.setLevel(logging.INFO)  # Keep full INFO in the file
-    
+
         console_handler = logging.StreamHandler()
         console_handler.setLevel(logging.WARNING)  # Only WARNING+ to console/stderr
-    
+
         # Set format for both
         formatter = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
         file_handler.setFormatter(formatter)
         console_handler.setFormatter(formatter)
-    
+
         # Configure root logger
         logging.basicConfig(
             level=logging.INFO,  # Overall minimum level
             format="%(asctime)s - %(levelname)s - %(message)s",
             handlers=[file_handler, console_handler],
         )
-        
+
         self.logger = logging.getLogger(__name__)
 
     def _init_sqlite(self):
@@ -225,9 +259,11 @@ class RobustMemorySystem:
                 str(self.sqlite_path), check_same_thread=False, timeout=30.0
             )
             self.sqlite_conn.row_factory = sqlite3.Row
-            
+
             self.sqlite_conn.execute("PRAGMA journal_mode=WAL;")
-            self.sqlite_conn.execute("PRAGMA wal_autocheckpoint=500;")  # checkpoint every 500 pgs
+            self.sqlite_conn.execute(
+                "PRAGMA wal_autocheckpoint=500;"
+            )  # checkpoint every 500 pgs
             self.sqlite_conn.commit()
 
             # Create base tables (OK to have DEFAULT CURRENT_TIMESTAMP here for fresh DBs)
@@ -257,6 +293,11 @@ class RobustMemorySystem:
                     value TEXT,  
                     updated_at TEXT DEFAULT CURRENT_TIMESTAMP  
                 );  
+                CREATE TABLE IF NOT EXISTS system_config (  
+                    key TEXT PRIMARY KEY,  
+                    value TEXT,  
+                    updated_at TEXT DEFAULT CURRENT_TIMESTAMP  
+                );  
             """
             )
 
@@ -265,17 +306,20 @@ class RobustMemorySystem:
             columns = [row[1] for row in cursor.fetchall()]
 
             if "last_accessed" not in columns:
-                self.logger.info("Adding last_accessed column to existing memories table")
+                self.logger.info(
+                    "Adding last_accessed column to existing memories table"
+                )
                 # 1) Add column WITHOUT default (avoids 'non-constant default' error)
-                self.sqlite_conn.execute("ALTER TABLE memories ADD COLUMN last_accessed TEXT")
+                self.sqlite_conn.execute(
+                    "ALTER TABLE memories ADD COLUMN last_accessed TEXT"
+                )
 
                 # 2) Backfill existing rows
                 now_iso = datetime.now(timezone.utc).isoformat()
                 self.sqlite_conn.execute(
-                    "UPDATE memories SET last_accessed = COALESCE(created_at, ?)"
-                    , (now_iso,)
+                    "UPDATE memories SET last_accessed = COALESCE(created_at, ?)",
+                    (now_iso,),
                 )
-
 
                 self.sqlite_conn.commit()
 
@@ -312,7 +356,8 @@ class RobustMemorySystem:
             chroma_path = str(self.db_folder / "chroma_db")
 
             self.chroma_client = chromadb.PersistentClient(
-                path=chroma_path, settings=Settings(anonymized_telemetry=False, allow_reset=True)
+                path=chroma_path,
+                settings=Settings(anonymized_telemetry=False, allow_reset=True),
             )
 
             # Use a stable collection name and cosine space
@@ -332,17 +377,123 @@ class RobustMemorySystem:
             raise
 
     def _init_embeddings(self):
-        """Initialize sentence transformer for embeddings"""
+        """Initialize embedding backend with fallback support"""
+        backend_type = EMBEDDING_BACKEND
+        backend_attempts = []
+
+        # Try to create the requested backend
         try:
-            # Use a good general-purpose model that works offline
-            model_name = "all-MiniLM-L6-v2"  # Fast, good quality, 384 dimensions
-            self.embedding_model = SentenceTransformer(model_name)
-            self.logger.info("Embedding model '%s' loaded successfully", model_name)
+            if backend_type == "sentence-transformers":
+                print(f"[MCP] Loading sentence-transformers backend: model={SENTENCE_TRANSFORMER_MODEL}, offline={EMBEDDING_OFFLINE}")
+                self.embedding_backend = create_embedding_backend(
+                    backend_type=backend_type,
+                    model_name=SENTENCE_TRANSFORMER_MODEL,
+                    offline=EMBEDDING_OFFLINE,
+                )
+            elif backend_type == "ollama":
+                print(f"[MCP] Loading Ollama backend: model={OLLAMA_MODEL}, base_url={OLLAMA_BASE_URL}")
+                self.embedding_backend = create_embedding_backend(
+                    backend_type=backend_type,
+                    model_name=OLLAMA_MODEL,
+                    base_url=OLLAMA_BASE_URL,
+                )
+            else:
+                # Use fallback for any other type
+                print(f"[MCP] Loading fallback backend: dimensions={FALLBACK_DIMENSIONS}")
+                self.embedding_backend = create_embedding_backend(
+                    backend_type="fallback", dimensions=FALLBACK_DIMENSIONS
+                )
+
+            backend_attempts.append(f"{backend_type} (primary)")
+            print(f"[MCP] Embedding backend initialized: {self.embedding_backend.get_model_name()} ({self.embedding_backend.get_dimensions()} dimensions)")
+            self.logger.info(
+                f"Embedding backend initialized: {self.embedding_backend.get_model_name()} "
+                f"({self.embedding_backend.get_dimensions()} dimensions)"
+            )
+            self._write_status()
 
         except Exception as e:
-            self.logger.error("Failed to load embedding model: %s", e)
-            # Fallback to a simpler approach if needed
-            raise
+            self.logger.warning(f"Failed to initialize {backend_type} backend: {e}")
+            backend_attempts.append(f"{backend_type} (failed: {e})")
+
+            # Try fallback options
+            fallback_order = ["sentence-transformers", "ollama", "fallback"]
+            fallback_order.remove(backend_type)  # Remove already attempted
+
+            for fallback_type in fallback_order:
+                try:
+                    if fallback_type == "sentence-transformers":
+                        print(f"[MCP] Falling back to sentence-transformers: model=all-MiniLM-L6-v2, offline=True")
+                        self.embedding_backend = create_embedding_backend(
+                            backend_type=fallback_type,
+                            model_name="all-MiniLM-L6-v2",
+                            offline=True,
+                        )
+                    elif fallback_type == "ollama":
+                        print(f"[MCP] Falling back to ollama: model=nomic-embed-text:latest, base_url={OLLAMA_BASE_URL}")
+                        self.embedding_backend = create_embedding_backend(
+                            backend_type=fallback_type,
+                            model_name="nomic-embed-text:latest",
+                            base_url=OLLAMA_BASE_URL,
+                        )
+                    else:  # fallback
+                        print(f"[MCP] Falling back to fallback backend: dimensions={FALLBACK_DIMENSIONS}")
+                        self.embedding_backend = create_embedding_backend(
+                            backend_type="fallback", dimensions=FALLBACK_DIMENSIONS
+                        )
+
+                    backend_attempts.append(f"{fallback_type} (fallback success)")
+                    print(f"[MCP] Fallback backend initialized: {self.embedding_backend.get_model_name()} ({self.embedding_backend.get_dimensions()} dimensions)")
+                    self.logger.info(
+                        f"Using fallback embedding backend: {self.embedding_backend.get_model_name()} "
+                        f"({self.embedding_backend.get_dimensions()} dimensions)"
+                    )
+                    break
+
+                except Exception as fallback_e:
+                    backend_attempts.append(f"{fallback_type} (failed: {fallback_e})")
+
+            # If all backends failed, raise an error
+            if self.embedding_backend is None:
+                attempts_str = ", ".join(backend_attempts)
+                error_msg = f"All embedding backends failed. Attempted: {attempts_str}"
+                self.logger.error(error_msg)
+                raise RuntimeError(error_msg)
+
+            # Write status after successful fallback
+            self._write_status()
+
+    def _write_status(self):
+        """Write current backend status to status.json so the GUI can read it."""
+        import json
+        status = {
+            "loaded_backend": self.embedding_backend.get_model_name(),
+            "loaded_dimensions": self.embedding_backend.get_dimensions(),
+            "loaded_backend_type": (
+                "sentence-transformers"
+                if "sentence-transformers" in self.embedding_backend.get_model_name()
+                else "ollama"
+                if "ollama" in self.embedding_backend.get_model_name()
+                else "fallback"
+            ),
+            "config_backend": EMBEDDING_BACKEND,
+            "config_model": (
+                SENTENCE_TRANSFORMER_MODEL
+                if EMBEDDING_BACKEND == "sentence-transformers"
+                else OLLAMA_MODEL
+            ),
+            "config_base_url": OLLAMA_BASE_URL,
+            "status": "loaded",
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        try:
+            status_path = DEFAULT_CONFIG_DIR / "status.json"
+            status_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(status_path, "w") as f:
+                json.dump(status, f, indent=2)
+            print(f"[MCP] Status written to {status_path}")
+        except Exception as e:
+            print(f"[MCP] Failed to write status file: {e}")
 
     def _generate_id(self, content: str, timestamp: datetime) -> str:
         """Generate unique ID for memory record"""
@@ -375,6 +526,50 @@ class RobustMemorySystem:
 
         except Exception as e:
             self.logger.error("Integrity check failed: %s", e)
+
+    def _check_embedding_model_change(self):
+        """Check if embedding model has changed and warn if reindexing might be needed."""
+        try:
+            # Get current model info
+            current_model = self.embedding_backend.get_model_name()
+            current_dimensions = self.embedding_backend.get_dimensions()
+
+            # Try to get stored model info from SQLite
+            try:
+                cursor = self.sqlite_conn.execute(
+                    "SELECT value FROM system_config WHERE key = 'embedding_model'"
+                )
+                stored_model = cursor.fetchone()
+                if stored_model:
+                    stored_model = stored_model[0]
+
+                    # Check if model has changed
+                    if stored_model != current_model:
+                        self.logger.warning(
+                            f"Embedding model changed from '{stored_model}' to '{current_model}'. "
+                            f"Consider running reindex_vectors() for optimal search quality."
+                        )
+            except Exception:
+                # Table or row might not exist, that's OK for first run
+                pass
+
+            # Store current model info for future checks
+            try:
+                self.sqlite_conn.execute(
+                    "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
+                    ("embedding_model", current_model),
+                )
+                self.sqlite_conn.execute(
+                    "INSERT OR REPLACE INTO system_config (key, value) VALUES (?, ?)",
+                    ("embedding_dimensions", str(current_dimensions)),
+                )
+                self.sqlite_conn.commit()
+            except Exception as e:
+                # Might need to create the table first
+                self.logger.debug(f"Could not store model config: {e}")
+
+        except Exception as e:
+            self.logger.debug(f"Error checking embedding model change: {e}")
 
     def remember(
         self,
@@ -448,7 +643,7 @@ class RobustMemorySystem:
             # Generate embedding and store in ChromaDB
             # Combine title and content for better semantic search
             text_for_embedding = f"{title}\n{content}"
-            embedding = self.embedding_model.encode(text_for_embedding).tolist()
+            embedding = self.embedding_backend.get_embedding(text_for_embedding)
 
             self.chroma_collection.add(
                 ids=[record.id],
@@ -489,7 +684,9 @@ class RobustMemorySystem:
             self.sqlite_conn.rollback()
             return Result(success=False, reason=f"Storage error: {str(e)}")
 
-    def search_semantic(self, query: str, limit: int = 10, min_relevance: float = 0.15) -> Result:
+    def search_semantic(
+        self, query: str, limit: int = 10, min_relevance: float = 0.15
+    ) -> Result:
         """
         Semantic search using vector similarity with adaptive thresholding + top-1 fallback.
         """
@@ -504,7 +701,8 @@ class RobustMemorySystem:
             )
 
             # Generate query embedding
-            query_embedding = self.embedding_model.encode(query).tolist()
+            query_embedding = self.embedding_backend.get_embedding(query)
+            print(f"[MCP] search_semantic: query='{query}', backend={EMBEDDING_BACKEND}, embedding_dims={len(query_embedding)}")
 
             # Search ChromaDB
             results = self.chroma_collection.query(
@@ -514,19 +712,28 @@ class RobustMemorySystem:
             )
 
             if not results["ids"][0]:
+                print(f"[MCP] search_semantic: no results from ChromaDB")
                 return Result(success=True, data=[])
 
             ids = results["ids"][0]
             distances = results["distances"][0]
             similarities = [1.0 - d for d in distances]
 
+            print(f"[MCP] search_semantic: top similarities={[f'{s:.3f}' for s in similarities[:5]]}")
+
             # Adaptive threshold anchored on top match, with clamps
+            # Larger embedding models (Ollama 768d+) produce lower similarities,
+            # so use a lower floor for them vs sentence-transformers (384d)
+            is_ollama = EMBEDDING_BACKEND == "ollama"
+            floor = 0.05 if is_ollama else 0.12
             if similarities:
                 top_sim = similarities[0]
-                adaptive = max(0.12, min(0.35, top_sim - 0.08))
+                adaptive = max(floor, min(0.35, top_sim - 0.05))
                 threshold = max(min_relevance, adaptive)
             else:
                 threshold = min_relevance
+
+            print(f"[MCP] search_semantic: top_sim={top_sim:.3f}, adaptive={adaptive:.3f}, threshold={threshold:.3f}")
 
             self.logger.info("Adaptive threshold computed: %.3f", threshold)
 
@@ -534,20 +741,18 @@ class RobustMemorySystem:
             now_iso = datetime.now(timezone.utc).isoformat()
 
             # First pass: collect those meeting threshold
-            selected = [(mid, sim) for mid, sim in zip(ids, similarities) if sim >= threshold]
+            selected = [
+                (mid, sim) for mid, sim in zip(ids, similarities) if sim >= threshold
+            ]
 
             # FALLBACK: if none pass threshold, keep the top-1 candidate anyway
             if not selected and ids:
-                if similarities[0] >= 0.08:  # only fallback if it's not total garbage
-                    self.logger.info(
-                        "No candidates passed threshold; using top-1 semantic fallback"
-                    )
+                fallback_floor = 0.05 if is_ollama else 0.08
+                if similarities[0] >= fallback_floor:  # only fallback if it's not total garbage
+                    print(f"[MCP] search_semantic: no candidates passed threshold, using top-1 fallback (sim={similarities[0]:.3f})")
                     selected = [(ids[0], similarities[0])]
                 else:
-                    self.logger.info(
-                        "No candidates passed and top-1 sim %.3f < 0.08, skipping fallback",
-                        similarities[0],
-                    )
+                    print(f"[MCP] search_semantic: no candidates passed and top-1 sim {similarities[0]:.3f} < 0.05, skipping fallback")
 
             # Fetch selected rows and reinforce
             for i, (memory_id, relevance) in enumerate(selected):
@@ -573,7 +778,8 @@ class RobustMemorySystem:
 
                 # Reinforcement
                 self.sqlite_conn.execute(
-                    "UPDATE memories SET last_accessed = ? WHERE id = ?", (now_iso, memory_id)
+                    "UPDATE memories SET last_accessed = ? WHERE id = ?",
+                    (now_iso, memory_id),
                 )
 
                 record = MemoryRecord(
@@ -591,7 +797,9 @@ class RobustMemorySystem:
                     SearchResult(
                         record=record,
                         relevance_score=relevance,
-                        match_type="semantic" if relevance >= threshold else "semantic_fallback",
+                        match_type="semantic"
+                        if relevance >= threshold
+                        else "semantic_fallback",
                     )
                 )
 
@@ -681,8 +889,9 @@ class RobustMemorySystem:
             if memory_ids:
                 placeholders = ",".join(["?" for _ in memory_ids])
                 self.sqlite_conn.execute(
-                    f"UPDATE memories SET last_accessed = ? WHERE id IN ({
-                        placeholders})",
+                    f"""UPDATE memories SET last_accessed = ? WHERE id IN ({
+                        placeholders
+                    })""",
                     [now_iso] + memory_ids,
                 )
                 self.sqlite_conn.commit()
@@ -738,7 +947,9 @@ class RobustMemorySystem:
         """
         try:
             # Get existing record
-            cursor = self.sqlite_conn.execute("SELECT * FROM memories WHERE id = ?", (memory_id,))
+            cursor = self.sqlite_conn.execute(
+                "SELECT * FROM memories WHERE id = ?", (memory_id,)
+            )
             row = cursor.fetchone()
 
             if not row:
@@ -784,8 +995,7 @@ class RobustMemorySystem:
             params.append(memory_id)
 
             # Update SQLite
-            update_query = f"UPDATE memories SET {
-                ', '.join(updates)} WHERE id = ?"
+            update_query = f"""UPDATE memories SET {", ".join(updates)} WHERE id = ?"""
             self.sqlite_conn.execute(update_query, params)
 
             # Update ChromaDB if content changed
@@ -797,9 +1007,10 @@ class RobustMemorySystem:
                 updated_row = cursor.fetchone()
 
                 # Re-generate embedding
-                text_for_embedding = f"{updated_row['title']}\n{
-                    updated_row['content']}"
-                embedding = self.embedding_model.encode(text_for_embedding).tolist()
+                text_for_embedding = (
+                    f"""{updated_row["title"]}\n{updated_row["content"]}"""
+                )
+                embedding = self.embedding_backend.get_embedding(text_for_embedding)
 
                 # Update ChromaDB
                 self.chroma_collection.update(
@@ -857,7 +1068,8 @@ class RobustMemorySystem:
 
             self.logger.info("Memory deleted successfully: %s", memory_id)
             return Result(
-                success=True, data=[{"id": memory_id, "title": row["title"], "deleted": True}]
+                success=True,
+                data=[{"id": memory_id, "title": row["title"], "deleted": True}],
             )
 
         except Exception as e:
@@ -890,12 +1102,18 @@ class RobustMemorySystem:
                 ORDER BY count DESC
             """
             )
-            type_breakdown = {row["memory_type"]: row["count"] for row in cursor.fetchall()}
+            type_breakdown = {
+                row["memory_type"]: row["count"] for row in cursor.fetchall()
+            }
 
             # Get database sizes
-            sqlite_size = self.sqlite_path.stat().st_size if self.sqlite_path.exists() else 0
+            sqlite_size = (
+                self.sqlite_path.stat().st_size if self.sqlite_path.exists() else 0
+            )
             chroma_size = sum(
-                f.stat().st_size for f in (self.db_folder / "chroma_db").rglob("*") if f.is_file()
+                f.stat().st_size
+                for f in (self.db_folder / "chroma_db").rglob("*")
+                if f.is_file()
             )
 
             result_data = {
@@ -953,7 +1171,9 @@ class RobustMemorySystem:
             cursor = self.sqlite_conn.execute("SELECT COUNT(*) FROM memories")
             total_memories = cursor.fetchone()[0]
 
-            if hours_since_backup > 24 or (total_memories > 0 and total_memories % 100 == 0):
+            if hours_since_backup > 24 or (
+                total_memories > 0 and total_memories % 100 == 0
+            ):
                 self.create_backup()
 
         except Exception as e:
@@ -982,15 +1202,15 @@ class RobustMemorySystem:
             # Copy main .db
             sqlite_backup = backup_path / "memories.db"
             shutil.copy2(self.sqlite_path, sqlite_backup)
-        
+
             # Copy WAL and SHM if they exist (belt-and-suspenders)
             wal_path = Path(str(self.sqlite_path) + "-wal")
             shm_path = Path(str(self.sqlite_path) + "-shm")
-        
+
             if wal_path.exists():
                 shutil.copy2(wal_path, backup_path / "memories.db-wal")
                 self.logger.info("Copied WAL file to backup")
-        
+
             if shm_path.exists():
                 shutil.copy2(shm_path, backup_path / "memories.db-shm")
                 self.logger.info("Copied SHM file to backup")
@@ -1001,7 +1221,9 @@ class RobustMemorySystem:
                 shutil.copytree(self.db_folder / "chroma_db", chroma_backup)
 
             # Export to JSON for portability
-            cursor = self.sqlite_conn.execute("SELECT * FROM memories ORDER BY timestamp")
+            cursor = self.sqlite_conn.execute(
+                "SELECT * FROM memories ORDER BY timestamp"
+            )
             memories = []
             for row in cursor.fetchall():
                 memory_dict = dict(row)
@@ -1039,7 +1261,11 @@ class RobustMemorySystem:
             for old_backup in backups[10:]:
                 shutil.rmtree(old_backup)
 
-            self.logger.warning("Backup created successfully: %s (memories: %d)", backup_name, len(memories))
+            self.logger.warning(
+                "Backup created successfully: %s (memories: %d)",
+                backup_name,
+                len(memories),
+            )
             return Result(
                 success=True,
                 data=[
@@ -1077,8 +1303,11 @@ class RobustMemorySystem:
         except Exception:
             pass
 
-        # Optional: free embedding model reference
+        # Optional: free embedding backend reference
         try:
+            if hasattr(self, "embedding_backend"):
+                self.embedding_backend = None
+            # Also clean up old attribute name for backward compatibility
             if hasattr(self, "embedding_model"):
                 self.embedding_model = None
         except Exception:
@@ -1110,7 +1339,9 @@ class RobustMemorySystem:
         """
         try:
             count = self.chroma_collection.count()
-            data = self.chroma_collection.get(include=["documents", "metadatas"], limit=sample)
+            data = self.chroma_collection.get(
+                include=["documents", "metadatas"], limit=sample
+            )
             return {
                 "count": count,
                 "ids": data.get("ids", []),
@@ -1151,12 +1382,14 @@ class RobustMemorySystem:
             ).fetchall()
 
             ids, embs, docs, metas = [], [], [], []
-            for row in rows:
-                text = f"{row['title']}\n{row['content']}"
-                emb = self.embedding_model.encode(text).tolist()
+            # Use batch embeddings if available for better performance
+            texts = [f"{row['title']}\n{row['content']}" for row in rows]
+            embeddings = self.embedding_backend.get_embeddings(texts)
+
+            for i, row in enumerate(rows):
                 ids.append(row["id"])
-                embs.append(emb)
-                docs.append(text)
+                embs.append(embeddings[i])
+                docs.append(texts[i])
                 metas.append(
                     {
                         "title": row["title"],
@@ -1185,7 +1418,8 @@ class RobustMemorySystem:
                 self.logger.warning("Chroma persist warning: %s", pe)
 
             return Result(
-                success=True, data=[{"reindexed": True, "count": self.chroma_collection.count()}]
+                success=True,
+                data=[{"reindexed": True, "count": self.chroma_collection.count()}],
             )
         except Exception as e:
             self.logger.error("Reindex failed: %s", e)
@@ -1205,15 +1439,21 @@ class RobustMemorySystem:
             return 0.0
         try:
             then = self._parse_iso(iso_str)
-            return max(0.0, (datetime.now(timezone.utc) - then).total_seconds() / 86400.0)
+            return max(
+                0.0, (datetime.now(timezone.utc) - then).total_seconds() / 86400.0
+            )
         except Exception:
             return 0.0
 
     def _get_half_life_days(self, memory_type: Optional[str]) -> float:
-        return DECAY_HALF_LIFE_DAYS_BY_TYPE.get(memory_type or "", DECAY_HALF_LIFE_DAYS_DEFAULT)
+        return DECAY_HALF_LIFE_DAYS_BY_TYPE.get(
+            memory_type or "", DECAY_HALF_LIFE_DAYS_DEFAULT
+        )
 
     def _get_floor(self, memory_type: Optional[str]) -> int:
-        return DECAY_MIN_IMPORTANCE_BY_TYPE.get(memory_type or "", DECAY_MIN_IMPORTANCE_DEFAULT)
+        return DECAY_MIN_IMPORTANCE_BY_TYPE.get(
+            memory_type or "", DECAY_MIN_IMPORTANCE_DEFAULT
+        )
 
     def _should_protect(self, tags_field) -> bool:
         try:
@@ -1291,7 +1531,9 @@ class RobustMemorySystem:
                 meta = {}
 
             last_decay_at = meta.get("last_decay_at")
-            hours_since_last = self._days_since(last_decay_at) * 24 if last_decay_at else 1e9
+            hours_since_last = (
+                self._days_since(last_decay_at) * 24 if last_decay_at else 1e9
+            )
             if hours_since_last < DECAY_MIN_INTERVAL_HOURS:
                 self.logger.info(
                     "Decay check: id=%s type=%s old=%s → would become %s "
@@ -1358,7 +1600,9 @@ class RobustMemorySystem:
 
             # If accumulated boost reaches threshold, persist
             if accum >= REINFORCEMENT_WRITEBACK_STEP:
-                new_importance = min(REINFORCEMENT_MAX, self._round_to_half(importance + accum))
+                new_importance = min(
+                    REINFORCEMENT_MAX, self._round_to_half(importance + accum)
+                )
                 meta["reinforcement_accum"] = 0.0  # reset accumulator
 
                 self.sqlite_conn.execute(
@@ -1394,7 +1638,9 @@ class RobustMemorySystem:
             return None
 
         except Exception as e:
-            self.logger.warning("Reinforcement skipped for id=%s: %s", row.get("id", "UNKNOWN"), e)
+            self.logger.warning(
+                "Reinforcement skipped for id=%s: %s", row.get("id", "UNKNOWN"), e
+            )
             return None
 
 
@@ -1787,7 +2033,9 @@ def search_by_date_range(date_from: str, date_to: str = None, limit: int = 50) -
     """
     if date_to is None:
         date_to = datetime.now(timezone.utc).isoformat()
-    res = memory_system.search_structured(date_from=date_from, date_to=date_to, limit=limit)
+    res = memory_system.search_structured(
+        date_from=date_from, date_to=date_to, limit=limit
+    )
     return _jsonify_result(res)
 
 

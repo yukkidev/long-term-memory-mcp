@@ -6,6 +6,10 @@ chromadb>=0.4.15
 sentence-transformers>=2.2.2
 fastmcp>=1.0.0
 
+# Optional dependencies for alternative backends
+ollama>=0.2.0   # For Ollama backend support and OllamaDiscovery
+httpx>=0.25.0   # For OllamaDiscovery (Ollama/LM Studio model discovery)
+
 # Optional but recommended for better performance
 numpy>=1.24.0
 torch>=2.0.0  # For sentence-transformers (CPU version is fine)

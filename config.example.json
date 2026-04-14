@@ -1,0 +1,22 @@
+{
+  "_comment": "Example configuration for long-term-memory-mcp",
+  "_comment2": "Environment variables always override these values (for CI/dev flexibility).",
+  "_comment3": "Copy this file to config.json and edit values as needed.",
+
+  "embedding": {
+    "backend": "sentence-transformers",
+    "_note_backend": "Options: 'sentence-transformers' (local HuggingFace models), 'ollama' (local Ollama/LM Studio server), 'fallback' (simple testing backend)",
+
+    "model": null,
+    "_note_model": "Backend-specific model name. null = use backend default. Examples: 'all-MiniLM-L6-v2', 'nomic-embed-text:latest'",
+
+    "offline": true,
+    "_note_offline": "For sentence-transformers only: if true, only use locally cached models (requires TRANSFORMERS_OFFLINE=1)",
+
+    "base_url": "http://localhost:11434",
+    "_note_base_url": "For ollama backend only: Ollama or LM Studio server URL"
+  },
+
+  "fallback_dimensions": 384,
+  "_note_fallback": "Embedding dimensions for the fallback backend (testing only)"
+}
